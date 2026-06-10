@@ -385,3 +385,101 @@ mod tests {
         );
     }
 }
+
+/// Property-based parity check against the reference [`ResonatorBank`].
+///
+/// `power_matches_reference_bank` above pins parity at one hand-picked operating
+/// point (`alpha == beta`, five fixed frequencies, one signal). This module
+/// *fuzzes* the operating point the consuming app actually uses: independent
+/// `alpha_scale` / `beta_scale` (so `alpha != beta`), the full MIDI 12..=84
+/// range — including the high-Q low end where `heuristic_alpha` is tiny — and an
+/// arbitrary multi-partial stimulus.
+///
+/// The identity `v_n = rr_n · e^{+iωnΔt}` (see the module header) makes power
+/// algebraically *equal* for any `(alpha, beta, freq)`; only f32 round-off can
+/// separate the two formulations. So a wide rel/abs envelope that still trips on
+/// a real divergence is the right shape: if this stays green, swapping
+/// `ResonatorBank` → `OnePoleBank` cannot change a magnitude/power display.
+#[cfg(test)]
+mod parity_proptest {
+    use proptest::prelude::*;
+
+    use super::OnePoleBank;
+    use crate::{
+        ResonatorBank,
+        ResonatorConfig,
+        heuristic_alpha,
+        midi_to_hz,
+    };
+
+    /// Configs mirroring the consumer's `build_resonator_bank`: per-bin
+    /// `heuristic_alpha` scaled and clamped to the valid `(0, 1]` window.
+    ///
+    /// One bin per semitone (not the app's 5) — parity is per-bin independent of
+    /// neighbours, so the coarser grid covers the same `(freq, alpha, beta)`
+    /// regimes at a fraction of the cost.
+    fn app_configs(sr: f32, alpha_scale: f32, beta_scale: f32) -> Vec<ResonatorConfig> {
+        (12u32..=84)
+            .map(|midi| {
+                let freq = midi_to_hz(midi as f32, 440.0);
+                let h = heuristic_alpha(freq, sr);
+                let alpha = (h * alpha_scale).clamp(0.0001, 1.0);
+                let beta = (h * beta_scale).clamp(0.0001, 1.0);
+                ResonatorConfig::new(freq, alpha, beta)
+            })
+            .collect()
+    }
+
+    /// Sum-of-sines stimulus. Parameterised by a handful of `(freq, amp)` pairs
+    /// rather than a raw sample vector, so proptest shrinks toward a *simple
+    /// tone* on failure instead of an unreadable noise buffer.
+    fn synth(partials: &[(f32, f32)], n: usize, sr: f32) -> Vec<f32> {
+        use std::f32::consts::TAU;
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / sr;
+                partials.iter().map(|&(f, a)| a * (TAU * f * t).sin()).sum()
+            })
+            .collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+        #[test]
+        fn onepole_power_matches_reference_bank(
+            alpha_scale in 0.1f32..4.0,
+            beta_scale in 0.1f32..4.0,
+            partials in prop::collection::vec((30.0f32..6000.0, 0.05f32..1.0), 1..4),
+        ) {
+            let sr = 44_100.0;
+            let configs = app_configs(sr, alpha_scale, beta_scale);
+            // 0.5 s — long enough to leave the initial transient at audible Qs.
+            let signal = synth(&partials, sr as usize / 2, sr);
+
+            let mut reference = ResonatorBank::new(&configs, sr);
+            let mut onepole = OnePoleBank::new(&configs, sr);
+            reference.process_samples(&signal);
+            onepole.process_samples(&signal);
+
+            let pr = reference.powers();
+            let po = onepole.powers();
+            // Quiet bins carry only f32 noise, where *relative* error is unbounded
+            // and meaningless; floor the tolerance to a fraction of the loudest
+            // bin so we judge the bins that actually paint pixels.
+            let peak = pr.iter().chain(&po).cloned().fold(0.0f32, f32::max).max(1e-12);
+
+            for i in 0..configs.len() {
+                let diff = (pr[i] - po[i]).abs();
+                // 0.5 % relative on the bin itself + 0.1 % of the global peak.
+                // A genuine formulation bug is whole-percent or worse; f32
+                // round-off lives far below this.
+                let tol = 5e-3 * pr[i].max(po[i]) + 1e-3 * peak;
+                prop_assert!(
+                    diff <= tol,
+                    "bin {i} f={:.1}Hz a={:.4} b={:.4}: ref={} onepole={} diff={:e} tol={:e}",
+                    configs[i].freq, configs[i].alpha, configs[i].beta, pr[i], po[i], diff, tol
+                );
+            }
+        }
+    }
+}
