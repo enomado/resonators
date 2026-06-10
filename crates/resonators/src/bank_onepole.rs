@@ -197,12 +197,22 @@ impl OnePoleBank {
     /// Absolute-frame complex value, recovered by de-rotating the stored state
     /// by `e^{-iωnΔt}` where `n` is the index of the last processed sample.
     /// This is the only place trig is evaluated, and only on readout.
+    ///
+    /// The de-rotation angle `2π·f·n/sr` grows without bound as `n` accumulates,
+    /// so it is formed and reduced in `f64`. At `f32` the `sin`/`cos` argument
+    /// degrades within minutes (ulp ≈ 0.2 rad after ~10 min at 440 Hz) and is
+    /// meaningless after about an hour — long-running phase/`complex` readouts
+    /// would drift into noise. `f64` keeps it accurate for many hours. The power
+    /// path ([`power`](Self::power)) is frame-invariant and never touches this.
     pub fn complex(&self, i: usize) -> Complex32 {
         if self.sample_count == 0 {
             return Complex32::new(self.v_re[i], self.v_im[i]);
         }
-        let n = (self.sample_count - 1) as f32;
-        let theta = 2.0 * PI * self.frequencies[i] * n / self.sample_rate;
+        let n = (self.sample_count - 1) as f64;
+        let theta =
+            std::f64::consts::TAU * self.frequencies[i] as f64 * n / self.sample_rate as f64;
+        // Reduce before the cast so the f32 trig argument stays in [0, 2π).
+        let theta = theta.rem_euclid(std::f64::consts::TAU) as f32;
         let (s, cth) = theta.sin_cos();
         // (v_re + i v_im) * (cos - i sin)
         let re = self.v_re[i] * cth + self.v_im[i] * s;
@@ -329,5 +339,49 @@ mod tests {
         assert!(bank.magnitude(0) > 0.0);
         bank.reset();
         assert_eq!(bank.power(0), 0.0);
+    }
+
+    /// Phase readout must stay accurate after a long run, when the de-rotation
+    /// index `n` is large. Detuning recovered from two phase samples 128 apart
+    /// should still match the true offset — this fails outright if the
+    /// de-rotation is done in f32 (the trig argument is ~2.5e6 rad here).
+    #[test]
+    fn phase_readout_stable_at_large_sample_count() {
+        use std::f32::consts::TAU;
+        let sr = 44100.0;
+        let f_bin = 440.0;
+        let f_in = 441.0; // +1 Hz
+        let a = heuristic_alpha(f_bin, sr);
+        let mut bank = OnePoleBank::new(&[ResonatorConfig::new(f_bin, a, a)], sr);
+
+        // Generate the input from a wrapped phase accumulator so the *stimulus*
+        // stays clean at large n (a naive sin(2π f n/sr) in f32 would itself rot).
+        let dph = std::f64::consts::TAU * f_in / sr as f64;
+        let mut ph = 0.0f64;
+        let mut next = || {
+            let s = ph.sin() as f32;
+            ph += dph;
+            if ph >= std::f64::consts::TAU {
+                ph -= std::f64::consts::TAU;
+            }
+            s
+        };
+
+        // ~90 s of audio → n ≈ 4 million.
+        let warm: Vec<f32> = (0..(90 * sr as usize)).map(|_| next()).collect();
+        bank.process_samples(&warm);
+
+        let p0 = bank.phase(0);
+        let gap = 128usize;
+        let probe: Vec<f32> = (0..gap).map(|_| next()).collect();
+        bank.process_samples(&probe);
+        let p1 = bank.phase(0);
+
+        let dphi = (p1 - p0 + PI).rem_euclid(TAU) - PI;
+        let detuning = dphi / (TAU * gap as f32 / sr);
+        assert!(
+            (detuning - 1.0).abs() < 0.1,
+            "detuning {detuning} should be ~1.0 Hz even at large n"
+        );
     }
 }
