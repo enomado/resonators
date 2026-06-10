@@ -1,0 +1,333 @@
+//! Reformulated resonator bank: two cascaded complex one-poles, no running
+//! phasor, no periodic stabilization.
+//!
+//! The reference [`ResonatorBank`](crate::ResonatorBank) maintains, per
+//! resonator, a unit phasor `z` that it rotates by `e^{-iωΔt}` every sample and
+//! must periodically renormalize (because `|w| != 1` exactly in `f32`, so `z`
+//! drifts). The EWMA accumulates `α·x·z`.
+//!
+//! Moving into the de-rotated frame `u_n = r_n · e^{+iωnΔt}` collapses the
+//! "rotate phasor + EWMA" pair into a single complex one-pole with a constant
+//! complex coefficient:
+//!
+//! ```text
+//! u_n = c·u_{n-1} + α·x_n        c = (1-α)·e^{+iωΔt}
+//! v_n = d·v_{n-1} + β·u_n        d = (1-β)·e^{+iωΔt}   (output smoothing)
+//! ```
+//!
+//! Because `|e^{-iωnΔt}| = 1`, power and magnitude are identical to the
+//! reference: `|v_n| ≡ |rr_n|`. The absolute-frame complex value (and hence
+//! phase) is recovered lazily at readout by multiplying by `e^{-iωnΔt}` — only
+//! at hop boundaries, never per sample.
+//!
+//! Numerically this is strictly contractive: `|c| = (1-α) < 1`, so round-off
+//! decays instead of accumulating. There is nothing to stabilize.
+
+use std::f32::consts::PI;
+
+use num_complex::Complex32;
+
+use crate::config::ResonatorConfig;
+use crate::dynamics::heuristic_alphas;
+
+#[derive(Debug)]
+pub struct OnePoleBank {
+    n_resonators: usize,
+    frequencies: Vec<f32>,
+
+    // input gains
+    alphas: Vec<f32>,
+    betas: Vec<f32>,
+
+    // first-stage one-pole coefficient c = (1-alpha) e^{+i w dt}
+    c_re: Vec<f32>,
+    c_im: Vec<f32>,
+    // second-stage (output smoothing) one-pole coefficient d = (1-beta) e^{+i w dt}
+    d_re: Vec<f32>,
+    d_im: Vec<f32>,
+
+    // first-stage state (de-rotated frame)
+    u_re: Vec<f32>,
+    u_im: Vec<f32>,
+    // second-stage state (de-rotated frame)
+    v_re: Vec<f32>,
+    v_im: Vec<f32>,
+
+    // sample index of the most recently processed sample, needed only to
+    // de-rotate at readout. Not used in the hot loop.
+    sample_count: u64,
+    sample_rate: f32,
+}
+
+#[allow(clippy::len_without_is_empty)]
+impl OnePoleBank {
+    pub fn from_frequencies(freqs: &[f32], sample_rate: f32) -> Self {
+        let alphas = heuristic_alphas(freqs, sample_rate);
+        let configs: Vec<ResonatorConfig> = freqs
+            .iter()
+            .zip(&alphas)
+            .map(|(&f, &a)| ResonatorConfig::new(f, a, a))
+            .collect();
+        Self::new(&configs, sample_rate)
+    }
+
+    pub fn new(configs: &[ResonatorConfig], sample_rate: f32) -> Self {
+        let n_resonators = configs.len();
+        let mut frequencies = Vec::with_capacity(n_resonators);
+        let mut alphas = Vec::with_capacity(n_resonators);
+        let mut betas = Vec::with_capacity(n_resonators);
+        let mut c_re = Vec::with_capacity(n_resonators);
+        let mut c_im = Vec::with_capacity(n_resonators);
+        let mut d_re = Vec::with_capacity(n_resonators);
+        let mut d_im = Vec::with_capacity(n_resonators);
+
+        for &ResonatorConfig { freq, alpha, beta } in configs {
+            // +ω·Δt: the de-rotated frame rotates opposite to the reference phasor.
+            let w = 2.0 * PI * freq / sample_rate;
+            let (ws, wc) = w.sin_cos();
+            frequencies.push(freq);
+            alphas.push(alpha);
+            betas.push(beta);
+            c_re.push((1.0 - alpha) * wc);
+            c_im.push((1.0 - alpha) * ws);
+            d_re.push((1.0 - beta) * wc);
+            d_im.push((1.0 - beta) * ws);
+        }
+
+        Self {
+            n_resonators,
+            frequencies,
+            alphas,
+            betas,
+            c_re,
+            c_im,
+            d_re,
+            d_im,
+            u_re: vec![0.0; n_resonators],
+            u_im: vec![0.0; n_resonators],
+            v_re: vec![0.0; n_resonators],
+            v_im: vec![0.0; n_resonators],
+            sample_count: 0,
+            sample_rate,
+        }
+    }
+
+    #[inline]
+    pub fn process_sample(&mut self, sample: f32) {
+        self.process_sample_inner(sample);
+        self.sample_count += 1;
+    }
+
+    #[inline]
+    pub fn process_samples(&mut self, samples: &[f32]) {
+        for &s in samples {
+            self.process_sample_inner(s);
+        }
+        self.sample_count += samples.len() as u64;
+    }
+
+    #[inline(always)]
+    fn process_sample_inner(&mut self, sample: f32) {
+        let n = self.n_resonators;
+        let alphas = &self.alphas[..n];
+        let betas = &self.betas[..n];
+        let c_re = &self.c_re[..n];
+        let c_im = &self.c_im[..n];
+        let d_re = &self.d_re[..n];
+        let d_im = &self.d_im[..n];
+        let u_re = &mut self.u_re[..n];
+        let u_im = &mut self.u_im[..n];
+        let v_re = &mut self.v_re[..n];
+        let v_im = &mut self.v_im[..n];
+
+        for k in 0..n {
+            // first one-pole: u = c*u + alpha*x   (alpha*x is real)
+            let ur = u_re[k];
+            let ui = u_im[k];
+            let nur = mul_add(c_re[k], ur, mul_add(-c_im[k], ui, alphas[k] * sample));
+            let nui = mul_add(c_re[k], ui, c_im[k] * ur);
+            u_re[k] = nur;
+            u_im[k] = nui;
+
+            // second one-pole (output smoothing): v = d*v + beta*u
+            let vr = v_re[k];
+            let vi = v_im[k];
+            v_re[k] = mul_add(d_re[k], vr, mul_add(-d_im[k], vi, betas[k] * nur));
+            v_im[k] = mul_add(d_re[k], vi, mul_add(d_im[k], vr, betas[k] * nui));
+        }
+    }
+
+    pub fn resonate(&mut self, signal: &[f32], hop: usize) -> Vec<Complex32> {
+        let n_frames = signal.len() / hop;
+        let mut out = Vec::with_capacity(n_frames * self.n_resonators);
+        for chunk in signal.chunks_exact(hop) {
+            self.process_samples(chunk);
+            for i in 0..self.n_resonators {
+                out.push(self.complex(i));
+            }
+        }
+        out
+    }
+
+    pub fn reset(&mut self) {
+        self.u_re.fill(0.0);
+        self.u_im.fill(0.0);
+        self.v_re.fill(0.0);
+        self.v_im.fill(0.0);
+        self.sample_count = 0;
+    }
+
+    pub fn len(&self) -> usize {
+        self.n_resonators
+    }
+
+    pub fn freq(&self, i: usize) -> f32 {
+        self.frequencies[i]
+    }
+
+    /// Power is frame-invariant: `|v_n|^2 == |rr_n|^2`. No de-rotation needed.
+    pub fn power(&self, i: usize) -> f32 {
+        self.v_re[i] * self.v_re[i] + self.v_im[i] * self.v_im[i]
+    }
+
+    pub fn magnitude(&self, i: usize) -> f32 {
+        self.power(i).sqrt()
+    }
+
+    /// Absolute-frame complex value, recovered by de-rotating the stored state
+    /// by `e^{-iωnΔt}` where `n` is the index of the last processed sample.
+    /// This is the only place trig is evaluated, and only on readout.
+    pub fn complex(&self, i: usize) -> Complex32 {
+        if self.sample_count == 0 {
+            return Complex32::new(self.v_re[i], self.v_im[i]);
+        }
+        let n = (self.sample_count - 1) as f32;
+        let theta = 2.0 * PI * self.frequencies[i] * n / self.sample_rate;
+        let (s, cth) = theta.sin_cos();
+        // (v_re + i v_im) * (cos - i sin)
+        let re = self.v_re[i] * cth + self.v_im[i] * s;
+        let im = self.v_im[i] * cth - self.v_re[i] * s;
+        Complex32::new(re, im)
+    }
+
+    /// Current phase at bin `i`, in radians. Requires de-rotation, so it is
+    /// computed from [`complex`](Self::complex).
+    pub fn phase(&self, i: usize) -> f32 {
+        let c = self.complex(i);
+        c.im.atan2(c.re)
+    }
+
+    /// A copy of every resonator's resonant frequency, in Hz.
+    pub fn frequencies(&self) -> Vec<f32> {
+        self.frequencies.clone()
+    }
+
+    pub fn magnitudes(&self) -> Vec<f32> {
+        (0..self.n_resonators).map(|i| self.magnitude(i)).collect()
+    }
+
+    pub fn phases(&self) -> Vec<f32> {
+        (0..self.n_resonators).map(|i| self.phase(i)).collect()
+    }
+
+    pub fn powers(&self) -> Vec<f32> {
+        (0..self.n_resonators).map(|i| self.power(i)).collect()
+    }
+}
+
+#[inline(always)]
+fn mul_add(a: f32, b: f32, c: f32) -> f32 {
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        a * b + c
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+    {
+        a.mul_add(b, c)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::heuristic_alpha;
+
+    #[test]
+    fn matched_sine_power_converges_near_one_quarter() {
+        let sr = 44100.0;
+        let freq = 440.0;
+        let alpha = heuristic_alpha(freq, sr);
+        let mut bank = OnePoleBank::new(&[ResonatorConfig::new(freq, alpha, alpha)], sr);
+        let signal: Vec<f32> = (0..2 * sr as usize)
+            .map(|i| (2.0 * PI * freq * i as f32 / sr).cos())
+            .collect();
+        bank.process_samples(&signal);
+        assert!(
+            (bank.power(0) - 0.25).abs() < 0.01,
+            "power should be ~0.25, got {}",
+            bank.power(0)
+        );
+    }
+
+    #[test]
+    fn peaks_at_matched_bin() {
+        let sr = 44100.0;
+        let freqs = [220.0, 440.0, 880.0];
+        let configs: Vec<_> = freqs
+            .iter()
+            .map(|&f| {
+                let a = heuristic_alpha(f, sr);
+                ResonatorConfig::new(f, a, a)
+            })
+            .collect();
+        let mut bank = OnePoleBank::new(&configs, sr);
+        let signal: Vec<f32> = (0..sr as usize)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / sr).cos())
+            .collect();
+        bank.process_samples(&signal);
+        let p = bank.powers();
+        assert!(p[1] > p[0] * 10.0, "440 should dominate 220: {p:?}");
+        assert!(p[1] > p[2] * 10.0, "440 should dominate 880: {p:?}");
+    }
+
+    #[test]
+    fn power_matches_reference_bank() {
+        // The whole point: identical power to the phasor formulation, up to f32.
+        use crate::ResonatorBank;
+        let sr = 44100.0;
+        let configs: Vec<_> = [110.0, 261.6, 440.0, 1000.0, 4186.0]
+            .iter()
+            .map(|&f| {
+                let a = heuristic_alpha(f, sr);
+                ResonatorConfig::new(f, a, a)
+            })
+            .collect();
+        let signal: Vec<f32> = (0..sr as usize)
+            .map(|i| {
+                let t = i as f32 / sr;
+                (2.0 * PI * 440.0 * t).sin() + 0.5 * (2.0 * PI * 110.0 * t).sin()
+            })
+            .collect();
+
+        let mut reference = ResonatorBank::new(&configs, sr);
+        let mut onepole = OnePoleBank::new(&configs, sr);
+        reference.process_samples(&signal);
+        onepole.process_samples(&signal);
+
+        for i in 0..configs.len() {
+            let pr = reference.power(i);
+            let po = onepole.power(i);
+            let rel = (pr - po).abs() / pr.max(1e-9);
+            assert!(rel < 1e-3, "bin {i}: ref={pr} onepole={po} rel={rel:e}");
+        }
+    }
+
+    #[test]
+    fn reset_clears_state() {
+        let mut bank = OnePoleBank::new(&[ResonatorConfig::new(440.0, 0.01, 0.01)], 44100.0);
+        bank.process_samples(&vec![0.5; 1000]);
+        assert!(bank.magnitude(0) > 0.0);
+        bank.reset();
+        assert_eq!(bank.power(0), 0.0);
+    }
+}
